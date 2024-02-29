@@ -1,19 +1,20 @@
-use cpal::traits::{ DeviceTrait, HostTrait, StreamTrait };
-use std::{ sync::mpsc::channel, time::Duration };
-use tokio::runtime::Runtime;
 use async_openai::{ types::{ AudioInput, CreateTranscriptionRequestArgs, InputSource }, Client };
+use cpal::traits::{ DeviceTrait, HostTrait, StreamTrait };
 use std::error::Error;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use async_openai::types::InputSource::VecU8;
+use std::fs::File;
+use std::io::Write;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    capture_and_transcribe().await;
+    let res = capture_and_transcribe().await.expect("REASON");
+    println!("{:?}", res);
 
     Ok(())
 }
 
-async fn send_audio_for_transcription(voice_record: AudioInput) -> Result<String, Box<dyn Error>> {
+async fn send_audio_for_transcription(voice_record: AudioInput) -> anyhow::Result<String> {
     let client = Client::new(); // Assuming the client is instantiated without needing an API key; adjust as necessary.
 
     let request = CreateTranscriptionRequestArgs::default()
@@ -26,7 +27,7 @@ async fn send_audio_for_transcription(voice_record: AudioInput) -> Result<String
     Ok(response.text)
 }
 
-async fn capture_and_transcribe() {
+async fn capture_and_transcribe() -> anyhow::Result<String> {
     let (tx, mut rx) = mpsc::channel(32);
 
     std::thread::spawn(move || {
@@ -35,7 +36,7 @@ async fn capture_and_transcribe() {
         let config = device.default_input_config().unwrap();
 
         let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let audio_chunk = encode_audio_to_format(data); // You need to implement this
+            let audio_chunk = encode_audio_to_format(data).unwrap(); // Ensure this handles errors properly
             tx.blocking_send(audio_chunk).unwrap();
         };
 
@@ -48,29 +49,42 @@ async fn capture_and_transcribe() {
             )
             .unwrap();
         stream.play().unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(15)); // Capture for a limited time
+        std::thread::sleep(Duration::from_secs(10));
+        drop(stream); // Dropping the stream stops the capture.
     });
+    if let Some(chunk_result) = rx.recv().await {
+        let audio_data = chunk_result.to_vec(); 
+        save_audio_to_file(&audio_data, "audio.wav")?; // Correctly call save_audio_to_file
 
-    while let Some(chunk) = rx.recv().await {
-        if
-            let Ok(transcription) = send_audio_for_transcription(AudioInput {
-                source: InputSource::VecU8 {
-                    filename: String::from("audio.mp3"),
-                    vec: chunk.expect("REASON"),
-                },
-            }).await
-        {
-            println!("Transcription: {}", transcription);
-        } // You need to implement this
+        return send_audio_for_transcription(AudioInput {
+            source: InputSource::VecU8 {
+                filename: String::from("audio.wav"),
+                vec: audio_data, // Now correctly a Vec<u8>
+            },
+        }).await;
     }
+    /*     while let Some(chunk) = rx.recv().await {
+        if let Ok(transcription) = send_audio_for_transcription(AudioInput {
+            source: InputSource::VecU8 {
+                filename: String::from("audio.mp3"),
+                vec: chunk.into(),
+            },
+        })
+        .await
+        {
+            return Ok(transcription); // Return as soon as a transcription is successfully received
+        }
+    } */
+
+    Err(anyhow::anyhow!("No transcription received"))
 }
 
 fn err_fn(err: cpal::StreamError) {
     eprintln!("An error occurred on stream: {}", err);
 }
 
+use hound::{ SampleFormat, WavSpec, WavWriter };
 use std::io::Cursor;
-use hound::{ WavSpec, WavWriter, SampleFormat };
 
 fn encode_audio_to_format(data: &[f32]) -> anyhow::Result<Vec<u8>> {
     let spec = WavSpec {
@@ -91,4 +105,10 @@ fn encode_audio_to_format(data: &[f32]) -> anyhow::Result<Vec<u8>> {
     }
 
     Ok(buffer.into_inner())
+}
+
+fn save_audio_to_file(audio_data: &[u8], file_name: &str) -> anyhow::Result<()> {
+    let mut file = File::create(file_name)?;
+    file.write_all(audio_data)?;
+    Ok(())
 }
